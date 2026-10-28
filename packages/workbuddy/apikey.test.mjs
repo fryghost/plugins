@@ -38,7 +38,7 @@ for (const [plugin, site, url] of [
   test(`${site}: offers an API key sign-in beside the browser and desktop ones`, async () => {
     const hooks = await plugin({ client: {} })
     const ms = hooks.auth.methods
-    expect(ms.map((m) => m.type)).toEqual(["oauth", "oauth", "api"])
+    expect(ms.slice(0, 3).map((m) => m.type)).toEqual(["oauth", "oauth", "api"])
     const name = _internal.SITES[site].name
     expect(ms[2].label).toBe(`${name} API key`)
     expect(ms[2].placeholder).toContain(site === "workbuddy" ? "www.workbuddy.cn/profile/keys" : "www.workbuddy.ai/profile/keys")

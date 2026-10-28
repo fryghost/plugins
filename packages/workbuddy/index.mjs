@@ -228,13 +228,13 @@ function refreshable(a) {
 // renew spends a's refresh token, once: those who come while it runs, or
 // within KEEP_RENEWED_MS of it, get what it gave. save keeps the result.
 function renew(site, a, save) {
-  const key = site.id + "\n" + a.refresh
+  const key = site.id + "\n" + (a.enterpriseLogin ? `${a.uid}\n${a.enterpriseId}\n` : "") + a.refresh
   const done = renewed.get(key)
   if (done && Date.now() - done.at < KEEP_RENEWED_MS) return Promise.resolve(merged(a, done.next))
   let r = renewing.get(key)
   if (!r) {
     r = (async () => {
-      const got = await call(site, "POST", "/v2/plugin/auth/token/refresh", {
+      const got = await call(a.enterpriseLogin ? enterpriseSite(site) : site, "POST", "/v2/plugin/auth/token/refresh", {
         "X-Refresh-Token": a.refresh,
         "X-Auth-Refresh-Source": "plugin",
         "X-Domain": domainOf(site, a),
@@ -242,6 +242,7 @@ function renew(site, a, save) {
       }, {})
       if (!got?.accessToken) throw Object.assign(new Error("WorkBuddy gave no refreshed token"), { bare: true })
       const next = merge(a, got)
+      if (a.enterpriseLogin) await verifyEnterprise(site, next, got)
       renewed.set(key, { next, at: Date.now() })
       await save?.(next)
       return next
@@ -276,6 +277,7 @@ async function fresh(site, client, a) {
       } catch {}
     })
   } catch (e) {
+    if (e?.code === "WB_ENTERPRISE_IDENTITY") throw e
     if (a.access) return a
     if (e?.bare) throw e
     throw new Error(`WorkBuddy token refresh: ${e?.said ?? e?.message ?? e}`)
@@ -434,6 +436,92 @@ async function enterpriseOf(site, a, who) {
   const last = mine.filter((x) => x.lastLogin)
   const pick = same.length === 1 ? same[0] : last.length === 1 ? last[0] : mine.length === 1 ? mine[0] : undefined
   return pick ? pick.enterpriseId.trim() : ""
+}
+
+// Enterprise links belong to an existing login session. Keep their state,
+// owner and device parameters together; never generate another auth state.
+const ENTERPRISE_HOSTS = new Set(["www.workbuddy.cn", "www.codebuddy.cn", "copilot.tencent.com", "wb.tencentbuddy.com"])
+const enterpriseSite = (site) => ({ ...site, endpoint: "https://www.workbuddy.cn" })
+
+function enterpriseLink(value) {
+  let url
+  try { url = new URL(String(value ?? "").trim()) } catch { throw new Error("请输入完整的 WorkBuddy 企业登录链接") }
+  if (url.protocol !== "https:" || !ENTERPRISE_HOSTS.has(url.hostname) || url.port || url.username || url.password || !/^\/login\/?$/.test(url.pathname))
+    throw new Error("企业登录链接必须是国内 WorkBuddy 的 HTTPS 登录页面")
+  const state = url.searchParams.get("state")
+  if (url.searchParams.getAll("state").length !== 1 || !/^[a-zA-Z0-9-]{1,128}$/.test(state ?? "") ||
+      url.searchParams.getAll("platform").length !== 1 || url.searchParams.get("platform") !== "workbuddy")
+    throw new Error("企业登录链接缺少有效的 state 或 workbuddy 平台标识；请复制新的完整链接")
+  url.searchParams.set("force_login_type", "wecom")
+  return { url: url.toString(), state }
+}
+
+function enabledEnterprises(data) {
+  return (data?.accounts ?? []).filter((a) => a.pluginEnabled === true && typeof a.uid === "string" && a.uid &&
+    typeof a.enterpriseId === "string" && a.enterpriseId.trim() && String(a.type ?? "").toLowerCase() !== "personal")
+}
+
+async function enterpriseAccountsFor(site, a) {
+  return enabledEnterprises(await call(enterpriseSite(site), "GET", "/v2/plugin/accounts", {
+    Authorization: "Bearer " + a.access, "X-Domain": domainOf(site, a),
+    ...(a.uid ? { "X-User-Id": a.uid } : {}),
+    ...enterpriseHeaders(a),
+  }))
+}
+
+async function verifyEnterprise(site, a, claims = {}) {
+  if (!a.uid || !a.enterpriseId ||
+      (claims.uid != null && claims.uid !== a.uid) ||
+      (claims.enterpriseId != null && claims.enterpriseId !== a.enterpriseId))
+    throw Object.assign(new Error("企业授权身份不匹配，请为目标企业重新登录"), { code: "WB_ENTERPRISE_IDENTITY" })
+  if (a.domain && !ENTERPRISE_HOSTS.has(a.domain))
+    throw Object.assign(new Error("企业授权返回了非国内 WorkBuddy 域名"), { code: "WB_ENTERPRISE_IDENTITY" })
+  const accounts = await enterpriseAccountsFor(site, a)
+  if (!accounts.some((x) => x.uid === a.uid && x.enterpriseId === a.enterpriseId))
+    throw Object.assign(new Error("目标企业成员身份已失效或不匹配，请重新登录"), { code: "WB_ENTERPRISE_IDENTITY" })
+}
+
+async function enterpriseSignIn(site, inputs = {}) {
+  const link = enterpriseLink(inputs.loginUrl)
+  const wanted = String(inputs.enterpriseId ?? "").trim()
+  return {
+    url: link.url,
+    instructions: "请使用企业微信扫码。链接过期时请复制新链接；每次登录只保存一个企业账号。",
+    method: "auto",
+    async callback() {
+      try {
+        const loginSite = enterpriseSite(site)
+        const token = await poll(loginSite, `/v2/plugin/auth/token?state=${encodeURIComponent(link.state)}`, {}, [11217], Date.now() + SIGN_IN_MS)
+        if (!token.accessToken) throw new Error("企业登录没有返回授权凭据，请使用新链接重试")
+        const base = merge({}, token)
+        const accounts = await enterpriseAccountsFor(site, base)
+        const matches = wanted ? accounts.filter((a) => a.enterpriseId === wanted) : accounts
+        if (!matches.length) throw new Error(wanted ? "该登录没有所指定企业的可用成员账号" : "该登录没有可用的企业账号")
+        if (matches.length !== 1) {
+          const choices = matches.slice(0, 6).map((a) => `${a.enterpriseName || a.name || "企业"}: ${a.enterpriseId}`).join("；")
+          throw new Error(`存在多个企业成员身份，请在登录表单填写目标企业 ID 后重试。${choices}`)
+        }
+        const member = matches[0]
+        const enterpriseId = member.enterpriseId.trim()
+        const switched = await call(loginSite, "POST", `/v2/plugin/login/enterprise/${encodeURIComponent(enterpriseId)}`, {
+          Authorization: "Bearer " + base.access, "X-Refresh-Token": base.refresh ?? "",
+          "X-Domain": domainOf(site, base), "X-Enterprise-Id": enterpriseId, "X-Tenant-Id": enterpriseId,
+        }, {})
+        if (!switched?.accessToken) throw new Error("企业切换没有返回授权凭据，未保存账号")
+        // Do not retain a personal refresh token if the enterprise switch
+        // didn't issue one: it could renew back into a personal session.
+        const a = { ...merge({ ...base, refresh: "", refreshExpiresAt: 0 }, switched), uid: member.uid, enterpriseId, enterpriseLogin: true,
+          enterpriseName: member.enterpriseName || member.name || enterpriseId }
+        await verifyEnterprise(site, a, switched)
+        // Magpie deduplicates by accountId and uid. Include a stable enterprise
+        // identity in accountId so personal and other enterprises coexist.
+        return { ...success(site, a, `WorkBuddy 企业 ${enterpriseId} · ${member.uid}`),
+          enterpriseLogin: true, enterpriseName: a.enterpriseName, nickname: member.nickname || member.uid }
+      } catch (e) {
+        return { type: "failed", error: e.message }
+      }
+    },
+  }
 }
 
 // WorkBuddy's own client names each chat to its gateway four ways: the
@@ -1472,6 +1560,8 @@ const desktopHeld = new Map()
 // current is the sign-in a stored auth names, fresh: WorkBuddy desktop's,
 // read where it keeps it, or one kept here.
 async function current(site, client, auth) {
+  if (auth?.enterpriseLogin && (site.ai || !auth.uid || !auth.enterpriseId))
+    throw new Error("企业账号身份不完整，请重新登录")
   if (auth?.source !== "desktop") return fresh(site, client, auth)
   const d = readDesktop(site)
   if (!d) throw new Error(notDesktop(site))
@@ -2416,7 +2506,7 @@ function makePlugin(site) {
         try {
           let a = await current(site, client, auth)
           // the meter has no /v2 prefix, on either site
-          const SUMMARY = "/billing/meter/get-user-resource-summary"
+          const SUMMARY = a.enterpriseLogin ? "/billing/meter/get-enterprise-user-usage" : "/billing/meter/get-user-resource-summary"
           // a 401 is answered as a chat's is: once, by a sign-in with
           // another access token, else the card says WorkBuddy refused
           // the sign-in and what to do; renewed, a mark comes off
@@ -2437,6 +2527,11 @@ function makePlugin(site) {
               return { error: refusedText(site, a, why), signIn: a.source !== "desktop" && e.invalidToken ? "expired" : "kept" }
             }
             said = "renewed"
+          }
+          if (a.enterpriseLogin) {
+            const ent = enterpriseUsageOf(sum)
+            if (!ent) throw new Error("企业接口没有返回可识别的成员额度")
+            return { plan: auth.plan || "Enterprise", windows: await spareFree(site, a, [ent]), signIn: said }
           }
           const out = usageOf(sum, auth.plan)
           // an enterprise account's summary has no packages: its credits
@@ -2484,6 +2579,16 @@ function makePlugin(site) {
           label: `${site.name} API key`,
           placeholder: `from ${site.keys.replace(/^https:\/\//, "")}`,
         },
+        ...(!site.ai ? [{
+          type: "oauth",
+          label: "WorkBuddy 企业账号（企业微信登录链接）",
+          prompts: [
+            { type: "text", key: "loginUrl", message: "企业登录链接（扫码前的完整链接）", placeholder: "https://www.workbuddy.cn/login?platform=workbuddy&state=…",
+              validate(value) { try { enterpriseLink(value); return undefined } catch (e) { return e.message } } },
+            { type: "text", key: "enterpriseId", message: "企业 ID（只有一个可用企业时可留空）", placeholder: "可选；多个企业时填写目标企业 ID" },
+          ],
+          authorize: (inputs) => enterpriseSignIn(site, inputs),
+        }] : []),
       ],
     },
   }

@@ -13,6 +13,54 @@ The package exports `WorkBuddyAuthPlugin` (`workbuddy`) and
 
 ## Signing in
 
+### Enterprise-link login (local fork)
+
+The China provider adds **WorkBuddy 企业账号（企业微信登录链接）** after the
+existing sign-in methods. Paste a fresh, complete pre-scan login URL from
+WorkBuddy, then scan with enterprise WeChat. The URL's `state`,
+`loginSessionId`, owner and device parameters are retained; the plugin polls
+that state on the domestic WorkBuddy endpoint rather than making a second
+authorization session. The URL is used for the sign-in only, never included
+in the saved credential. Do not put a real login URL in an issue or commit.
+
+An optional enterprise ID can be entered before scanning. One eligible
+enterprise member is selected automatically. With several, the plugin
+reports their IDs and asks you to retry with the intended ID; it never picks
+the first account. This uses Magpie's existing form and does not implement a
+post-scan enterprise picker. Add each enterprise as a new account. Reusing a
+desktop-generated session may compete with that app's own token polling;
+an expired or already-consumed session needs a fresh link.
+
+The plugin explicitly calls `/v2/plugin/login/enterprise/{id}`. A missing
+enterprise access token, inconsistent returned identity, or missing enabled
+membership fails the login. Membership is checked again with the switched
+token; this confirms membership, not by itself which tenant was billed.
+Actual enterprise access must also be checked with a model request and the
+vendor's enterprise usage record.
+
+Each account has a stable `accountId` containing the enterprise ID and uid,
+so names changing cannot merge two enterprises or overwrite a personal
+account. Enterprise name and nickname are kept separately as metadata. Only
+the refresh token issued by the enterprise switch is retained. Renewals
+carry the enterprise headers and verify membership before saving the new
+token; identity mismatches stop a request rather than reverting to the old
+credential. Ordinary personal, desktop and API-key sign-ins keep their
+existing behavior. WorkBuddy AI has no enterprise-link method.
+
+Local installation (use an absolute path to this package directory):
+
+```sh
+magpie plugin add /absolute/path/to/plugins/packages/workbuddy
+magpie plugin use /absolute/path/to/plugins/packages/workbuddy workbuddy
+magpie plugin use /absolute/path/to/plugins/packages/workbuddy workbuddy-ai
+```
+
+Local folder installations are not replaced by automatic npm upgrades.
+Keep the directory available. To roll back, use the original npm plugin
+for both providers again, then remove only the local plugin registration.
+Existing saved accounts remain available; back up Magpie's configuration
+and credential files before changing the registration.
+
 - **Account (browser).** Opens Tencent's sign-in page for the build, the
   one WorkBuddy's desktop app opens. The plugin then asks WorkBuddy for the
   token every second until you're signed in, for 5 minutes at most. Nothing
