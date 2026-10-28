@@ -13,6 +13,7 @@ import { createHash, randomBytes } from "node:crypto"
 import { readFileSync } from "node:fs"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { enterpriseLoginPage } from "./enterprise-login-page.mjs"
 
 const APP_VERSION = "2.0.0" // the version WorkBuddy's sign-in page is opened with
 const POLL_MS = 1000
@@ -164,7 +165,7 @@ class WBError extends Error {
 
 // call makes a request of WorkBuddy's plugin API, which answers
 // {code, msg, data}; a code but 0 is an error.
-async function call(site, method, path, headers = {}, body) {
+async function call(site, method, path, headers = {}, body, signal) {
   const res = await fetch(site.endpoint + path, {
     method,
     headers: {
@@ -174,7 +175,7 @@ async function call(site, method, path, headers = {}, body) {
       ...headers,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(30000),
+    signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(30000)]) : AbortSignal.timeout(30000),
   })
   const text = await res.text()
   let env = {}
@@ -483,25 +484,21 @@ async function verifyEnterprise(site, a, claims = {}) {
 
 async function enterpriseSignIn(site, inputs = {}) {
   const link = enterpriseLink(inputs.loginUrl)
-  const wanted = String(inputs.enterpriseId ?? "").trim()
+  const page = await enterpriseLoginPage(link.url, SIGN_IN_MS)
   return {
-    url: link.url,
-    instructions: "请使用企业微信扫码。链接过期时请复制新链接；每次登录只保存一个企业账号。",
+    url: page.url,
+    instructions: "请在打开的本机页面进入企业微信扫码页，扫码后返回；多个企业按名称选择，无需填写企业 ID。",
     method: "auto",
     async callback() {
       try {
         const loginSite = enterpriseSite(site)
-        const token = await poll(loginSite, `/v2/plugin/auth/token?state=${encodeURIComponent(link.state)}`, {}, [11217], Date.now() + SIGN_IN_MS)
+        const token = await poll(loginSite, `/v2/plugin/auth/token?state=${encodeURIComponent(link.state)}`, {}, [11217], page.deadline, page.signal)
         if (!token.accessToken) throw new Error("企业登录没有返回授权凭据，请使用新链接重试")
         const base = merge({}, token)
         const accounts = await enterpriseAccountsFor(site, base)
-        const matches = wanted ? accounts.filter((a) => a.enterpriseId === wanted) : accounts
-        if (!matches.length) throw new Error(wanted ? "该登录没有所指定企业的可用成员账号" : "该登录没有可用的企业账号")
-        if (matches.length !== 1) {
-          const choices = matches.slice(0, 6).map((a) => `${a.enterpriseName || a.name || "企业"}: ${a.enterpriseId}`).join("；")
-          throw new Error(`存在多个企业成员身份，请在登录表单填写目标企业 ID 后重试。${choices}`)
-        }
-        const member = matches[0]
+        if (!accounts.length) throw new Error("该登录没有可用的企业账号")
+        const member = await page.select(accounts)
+        page.signal.throwIfAborted()
         const enterpriseId = member.enterpriseId.trim()
         const switched = await call(loginSite, "POST", `/v2/plugin/login/enterprise/${encodeURIComponent(enterpriseId)}`, {
           Authorization: "Bearer " + base.access, "X-Refresh-Token": base.refresh ?? "",
@@ -513,11 +510,14 @@ async function enterpriseSignIn(site, inputs = {}) {
         const a = { ...merge({ ...base, refresh: "", refreshExpiresAt: 0 }, switched), uid: member.uid, enterpriseId, enterpriseLogin: true,
           enterpriseName: member.enterpriseName || member.name || enterpriseId }
         await verifyEnterprise(site, a, switched)
+        page.signal.throwIfAborted()
         // Magpie deduplicates by accountId and uid. Include a stable enterprise
         // identity in accountId so personal and other enterprises coexist.
+        page.finish()
         return { ...success(site, a, `WorkBuddy 企业 ${enterpriseId} · ${member.uid}`),
           enterpriseLogin: true, enterpriseName: a.enterpriseName, nickname: member.nickname || member.uid }
       } catch (e) {
+        page.finish(e.message)
         return { type: "failed", error: e.message }
       }
     },
@@ -1419,11 +1419,12 @@ function renamed(res, names) {
 
 // poll asks path until WorkBuddy answers with data, retrying the codes
 // that mean "not yet".
-async function poll(site, path, headers, retry, deadline) {
+async function poll(site, path, headers, retry, deadline, signal) {
   for (;;) {
+    signal?.throwIfAborted()
     if (Date.now() > deadline) throw new Error(`${site.name} sign-in timed out`)
     try {
-      const data = await call(site, "GET", path, headers)
+      const data = await call(site, "GET", path, headers, undefined, signal)
       if (data && Object.keys(data).length) return data
     } catch (e) {
       if (!(retry.includes(e.code) || e.status === 408 || e.status === 429)) throw e
@@ -2585,7 +2586,6 @@ function makePlugin(site) {
           prompts: [
             { type: "text", key: "loginUrl", message: "企业登录链接（扫码前的完整链接）", placeholder: "https://www.workbuddy.cn/login?platform=workbuddy&state=…",
               validate(value) { try { enterpriseLink(value); return undefined } catch (e) { return e.message } } },
-            { type: "text", key: "enterpriseId", message: "企业 ID（只有一个可用企业时可留空）", placeholder: "可选；多个企业时填写目标企业 ID" },
           ],
           authorize: (inputs) => enterpriseSignIn(site, inputs),
         }] : []),

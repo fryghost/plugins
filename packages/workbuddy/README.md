@@ -23,13 +23,19 @@ that state on the domestic WorkBuddy endpoint rather than making a second
 authorization session. The URL is used for the sign-in only, never included
 in the saved credential. Do not put a real login URL in an issue or commit.
 
-An optional enterprise ID can be entered before scanning. One eligible
-enterprise member is selected automatically. With several, the plugin
-reports their IDs and asks you to retry with the intended ID; it never picks
-the first account. This uses Magpie's existing form and does not implement a
-post-scan enterprise picker. Add each enterprise as a new account. Reusing a
-desktop-generated session may compete with that app's own token polling;
-an expired or already-consumed session needs a fresh link.
+No enterprise ID is entered. Magpie opens a temporary loopback guide: open
+the enterprise WeChat scan page from it, then return to the guide. After
+scanning, one eligible enterprise member is selected automatically; several
+are displayed by enterprise and member name for you to click. The IDs come
+from WorkBuddy's account list and are handled internally. It never picks the
+first of several. Add each enterprise as a new account.
+
+The guide binds only to 127.0.0.1 on an available port, with a random session
+path and same-origin checks. It holds no model credentials in the browser,
+expires after five minutes, and closes after completing or cancelling. No
+Magpie executable replacement is needed. Reusing a desktop-generated session
+may compete with that app's own token polling; an expired or already-consumed
+session needs a fresh link.
 
 The plugin explicitly calls `/v2/plugin/login/enterprise/{id}`. A missing
 enterprise access token, inconsistent returned identity, or missing enabled

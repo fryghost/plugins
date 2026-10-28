@@ -32,21 +32,41 @@ function server({ accounts = [member()], switched = enterpriseToken, after = acc
 async function sign(inputs = {}, options = {}) {
   const calls = server(options)
   const { login } = await method()
-  const flow = await login.authorize({ loginUrl: link, ...inputs })
-  return { result: await flow.callback(), calls, flow }
+  const flow = await login.authorize({ loginUrl: link })
+  const result = flow.callback()
+  if (inputs.pick !== undefined) {
+    await waiting(flow.url)
+    await select(flow.url, inputs.pick)
+  }
+  return { result: await result, calls, flow }
+}
+
+async function waiting(url) {
+  for (let i = 0; i < 100; i++) {
+    const state = await (await real(url + "status")).json()
+    if (state.stage === "choose") return state
+    await new Promise((r) => setTimeout(r, 3))
+  }
+  throw new Error("enterprise list never appeared")
+}
+async function select(url, choice) {
+  return real(url + "select", { method: "POST", headers: { Origin: new URL(url).origin, "Content-Type": "application/json" }, body: JSON.stringify({ choice }) })
 }
 
 test("enterprise login is a separate domestic method; old method indices stay unchanged", async () => {
   const { hooks, login } = await method()
   expect(hooks.auth.methods.map((m) => m.type)).toEqual(["oauth", "oauth", "api", "oauth"])
   expect(login).toBeDefined()
+  expect(login.prompts.map((p) => p.key)).toEqual(["loginUrl"])
   expect((await method(true)).login).toBeUndefined()
 })
 
 test("uses the pasted state and preserves owner/device parameters without another auth state", async () => {
   const { result, calls, flow } = await sign()
   expect(result.type).toBe("success")
-  const url = new URL(flow.url)
+  expect(new URL(flow.url).hostname).toBe("127.0.0.1")
+  const html = await (await real(flow.url)).text()
+  const url = new URL(html.match(/href="([^"]+)"/)[1].replaceAll("&amp;", "&"))
   for (const key of ["state", "version", "loginSessionId", "login_owner_id", "ww_device_nonce"])
     expect(url.searchParams.get(key)).toBe(new URL(link).searchParams.get(key))
   expect(url.searchParams.get("force_login_type")).toBe("wecom")
@@ -78,18 +98,27 @@ test("switches explicitly to the only enabled enterprise and keeps its own token
   expect(switched.headers.get("x-tenant-id")).toBe("ent-a")
 })
 
-test("multiple enterprises require an explicit id and no account is switched by default", async () => {
-  const { result, calls } = await sign({}, { accounts: [member(), member("ent-b")] })
-  expect(result.type).toBe("failed")
-  expect(result.error).toContain("ent-b")
+test("multiple enterprises are shown by name after scanning and wait for a click without switching", async () => {
+  const calls = server({ accounts: [member(), { ...member("ent-b"), enterpriseName: "Second company" }] })
+  const { login } = await method()
+  const flow = await login.authorize({ loginUrl: link })
+  const pending = flow.callback()
+  const state = await waiting(flow.url)
+  expect(state.choices.map((c) => c.name)).toEqual(["Example", "Second company"])
+  expect(JSON.stringify(state)).not.toContain("enterprise-refresh")
   expect(calls.some((c) => c.url.pathname.includes("/login/enterprise/"))).toBe(false)
+  expect((await select(flow.url, 99)).status).toBe(409)
+  expect((await select(flow.url, 1)).status).toBe(200)
+  const result = await pending
+  expect(result.type).toBe("success")
+  expect(result.enterpriseId).toBe("ent-b")
 })
 
 test("each selected enterprise is a separate stable account, even after names change", async () => {
   const accounts = [member(), member("ent-b")]
-  const a = (await sign({ enterpriseId: "ent-a" }, { accounts })).result
-  const b = (await sign({ enterpriseId: "ent-b" }, { accounts })).result
-  const renamed = (await sign({ enterpriseId: "ent-a" }, { accounts: [{ ...member(), nickname: "Renamed", enterpriseName: "New name" }] })).result
+  const a = (await sign({ pick: 0 }, { accounts })).result
+  const b = (await sign({ pick: 1 }, { accounts })).result
+  const renamed = (await sign({}, { accounts: [{ ...member(), nickname: "Renamed", enterpriseName: "New name" }] })).result
   expect(a.type).toBe("success")
   expect(b.type).toBe("success")
   expect(a.accountId).not.toBe(b.accountId)
@@ -103,7 +132,6 @@ test("personal-only and unlisted enterprise identities fail without switching", 
     expect(result.type).toBe("failed")
     expect(calls.some((c) => c.url.pathname.includes("/login/enterprise/"))).toBe(false)
   }
-  expect((await sign({ enterpriseId: "not-listed" })).result.type).toBe("failed")
 })
 
 test("missing enterprise token or mismatched returned identity never falls back to a personal sign-in", async () => {
